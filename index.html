@@ -1,0 +1,136 @@
+cat << 'EOF' > main.py
+import os
+import json
+import asyncio
+import urllib.parse
+from dotenv import load_dotenv
+from aiogram import Bot, Dispatcher, types, filters
+from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.types.web_app_info import WebAppInfo
+from google import genai
+from database import init_db, add_transaction, get_monthly_summary, get_all_history
+
+load_dotenv()
+
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+
+bot = Bot(token=BOT_TOKEN)
+dp = Dispatcher()
+ai_client = genai.Client(api_key=GEMINI_API_KEY)
+
+PARSE_PROMPT = """
+Ты — финансовый ассистент. Проанализируй сообщение пользователя и извлеки данные о транзакции.
+Верни ТОЛЬКО валидный JSON без markdown-разметки.
+Формат:
+{
+  "is_finance": true/false,
+  "type": "expense" или "income",
+  "amount": число,
+  "category": "категория",
+  "comment": "комментарий"
+}
+"""
+
+# ВАЖНО: Твоя ссылка на GitHub Pages
+GITHUB_PAGES_URL = "https://ТВОЙ_НИК.github.io/ТВОЯ_ПАПКА/"
+
+@dp.message(filters.CommandStart())
+async def start_cmd(message: types.Message):
+    web_app = WebAppInfo(url=GITHUB_PAGES_URL + "index.html")
+    keyboard = ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text="📊 Мои финансы", web_app=web_app)]],
+        resize_keyboard=True
+    )
+    await message.answer(
+        "Привет! Я бот для учета личных финансов.\n\n"
+        "Пиши траты текстом (например: '350 кофе').\n"
+        "Команда /stats покажет всю историю и аналитику.",
+        reply_markup=keyboard
+    )
+
+@dp.message(filters.Command("stats"))
+async def stats_cmd(message: types.Message):
+    await message.answer("🔄 Поднимаю архивы и генерирую совет...")
+    
+    records = get_all_history(message.from_user.id)
+    if not records:
+        await message.answer("Пока нет ни одной записи. Запиши свою первую трату!")
+        return
+
+    history = {}
+    for month, t_type, cat, total in records:
+        if month not in history:
+            history[month] = {"income": 0, "expenses": {}}
+        
+        if t_type == "expense":
+            history[month]["expenses"][cat] = total
+        else:
+            history[month]["income"] += total
+
+    latest_month = list(history.keys())[0]
+    latest_data = history[latest_month]
+    
+    ai_prompt = f"Мой доход за месяц: {latest_data['income']} руб. Траты: {latest_data['expenses']}. Дай короткий финансовый совет на 2 предложения. Общайся на 'ты'."
+    
+    try:
+        response = ai_client.models.generate_content(model="gemini-1.5-flash", contents=[ai_prompt])
+        ai_advice = response.text.strip()
+    except Exception:
+        ai_advice = "Продолжай вести учет, это первый шаг к богатству!"
+
+    payload = {
+        "history": history,
+        "advice": ai_advice,
+        "latest_month": latest_month
+    }
+    
+    encoded_data = urllib.parse.quote(json.dumps(payload))
+    web_app_url = f"{GITHUB_PAGES_URL}index.html?data={encoded_data}"
+    
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📊 Открыть историю трат", web_app=WebAppInfo(url=web_app_url))]
+    ])
+
+    await message.answer("Твоя история и аналитика готовы! Жми 👇", reply_markup=keyboard)
+
+@dp.message()
+async def process_text(message: types.Message):
+    user_text = message.text
+    if not user_text:
+        return
+
+    try:
+        response = ai_client.models.generate_content(
+            model="gemini-1.5-flash",
+            contents=[PARSE_PROMPT, f"Сообщение: {user_text}"]
+        )
+        raw_text = response.text.strip().replace("```json", "").replace("```", "")
+        data = json.loads(raw_text)
+
+        if not data.get("is_finance"):
+            await message.answer("Не удалось распознать операцию. Пример: '350 кофе'.")
+            return
+
+        add_transaction(
+            user_id=message.from_user.id,
+            t_type=data["type"],
+            amount=data["amount"],
+            category=data["category"],
+            comment=data.get("comment", "")
+        )
+
+        sign = "🔻 Расход" if data["type"] == "expense" else "🟢 Доход"
+        await message.answer(f"Записано: {sign} {data['amount']} ₽ ({data['category']})")
+
+    except Exception as e:
+        await message.answer("Ошибка при обработке сообщения.")
+        print(f"Error: {e}")
+
+async def main():
+    init_db()
+    await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    asyncio.run(main())
+EOF
